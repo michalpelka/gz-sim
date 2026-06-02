@@ -62,6 +62,7 @@
 #include <gz/physics/GetBoundingBox.hh>
 #include <gz/physics/GetEntities.hh>
 #include <gz/physics/GetRayIntersection.hh>
+#include <gz/physics/QuerySphereShape.hh>
 #include <gz/physics/Joint.hh>
 #include <gz/physics/Link.hh>
 #include <gz/physics/RemoveEntities.hh>
@@ -133,6 +134,7 @@
 #include "gz/sim/components/ParentEntity.hh"
 #include "gz/sim/components/ParentLinkName.hh"
 #include "gz/sim/components/RaycastData.hh"
+#include "gz/sim/components/SphereQueryData.hh"
 #include "gz/sim/components/ExternalWorldWrenchCmd.hh"
 #include "gz/sim/components/JointTransmittedWrench.hh"
 #include "gz/sim/components/JointForceCmd.hh"
@@ -325,6 +327,10 @@ class gz::sim::systems::PhysicsPrivate
   /// \brief Update ray intersection components from physics simulation
   /// \param[in] _ecm Mutable reference to ECM.
   public: void UpdateRayIntersections(EntityComponentManager &_ecm);
+
+  /// \brief Update sphere query components from physics simulation
+  /// \param[in] _ecm Mutable reference to ECM.
+  public: void UpdateSphereQueries(EntityComponentManager &_ecm);
 
   /// \brief FrameData relative to world at a given offset pose
   /// \param[in] _link gz-physics link
@@ -557,6 +563,11 @@ class gz::sim::systems::PhysicsPrivate
             MinimumFeatureList,
             physics::GetRayIntersectionFromLastStepFeature>{};
 
+  /// \brief Feature list to handle sphere overlap queries.
+  public: struct SphereQueryFeatureList : physics::FeatureList<
+            MinimumFeatureList,
+            physics::QuerySphereShapeFeature>{};
+
   /// \brief Feature list to change contacts before they are applied to physics.
   public: struct SetContactPropertiesCallbackFeatureList :
             physics::FeatureList<
@@ -702,6 +713,7 @@ class gz::sim::systems::PhysicsPrivate
           ContactFeatureList,
           GravityFeatureList,
           RayIntersectionFeatureList,
+          SphereQueryFeatureList,
           SetContactPropertiesCallbackFeatureList,
           NestedModelFeatureList,
           CollisionDetectorFeatureList,
@@ -4108,6 +4120,7 @@ void PhysicsPrivate::UpdateSim(EntityComponentManager &_ecm,
   this->UpdateCollisions(_ecm);
 
   this->UpdateRayIntersections(_ecm);
+  this->UpdateSphereQueries(_ecm);
 }  // NOLINT readability/fn_size
 // TODO (azeey) Reduce size of function and remove the NOLINT above
 
@@ -4376,6 +4389,65 @@ void PhysicsPrivate::UpdateRayIntersections(EntityComponentManager &_ecm)
             math::eigen3::convert(rayIntersectionResult.normal);
           result.normal = entityWorldPose.Rot().RotateVectorReverse(normal);
         }
+        return true;
+      });
+}
+
+//////////////////////////////////////////////////
+void PhysicsPrivate::UpdateSphereQueries(EntityComponentManager &_ecm)
+{
+  GZ_PROFILE("PhysicsPrivate::UpdateSphereQueries");
+  if (!_ecm.HasComponentType(components::SphereQueryData::typeId))
+    return;
+
+  Entity worldEntity = _ecm.EntityByComponents(components::World());
+  if (!this->entityWorldMap.HasEntity(worldEntity))
+  {
+    gzwarn << "Failed to find world [" << worldEntity << "]." << std::endl;
+    return;
+  }
+
+  auto worldSphereFeature =
+      this->entityWorldMap.EntityCast<SphereQueryFeatureList>(worldEntity);
+  if (!worldSphereFeature)
+  {
+    static bool informed{false};
+    if (!informed)
+    {
+      gzdbg << "Attempting sphere queries, but the physics engine doesn't "
+             << "support QuerySphereShapeFeature. Queries won't be computed."
+             << std::endl;
+      informed = true;
+    }
+    return;
+  }
+
+  _ecm.Each<components::SphereQueryData>(
+      [&](const Entity &/*_entity*/,
+          components::SphereQueryData *_queryData) -> bool
+      {
+        auto &info = _queryData->Data();
+        info.hits.resize(info.centers.size());
+
+        for (std::size_t i = 0; i < info.centers.size(); ++i)
+        {
+          info.hits[i].clear();
+
+          auto hits = worldSphereFeature->QuerySphereIntersections(
+              math::eigen3::convert(info.centers[i]),
+              info.radius);
+
+          for (const auto &h : hits)
+          {
+            components::SphereHitInfo hi;
+            hi.name   = h.shape->GetName();
+            hi.normal = math::eigen3::convert(h.normal);
+            hi.point  = math::eigen3::convert(h.point);
+            hi.depth  = h.depth;
+            info.hits[i].push_back(std::move(hi));
+          }
+        }
+
         return true;
       });
 }
